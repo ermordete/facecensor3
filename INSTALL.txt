@@ -1,0 +1,54 @@
+# FaceCensor Pro - Installationsanleitung
+# ==========================================
+
+# ─── Python-Pakete (pip) ───
+# pip3 install PyQt5
+# pip3 install numpy
+# opencv-python ist auf Jetson Nano i.d.R. vorinstalliert
+# Falls nicht: pip3 install opencv-python
+
+# ─── System-Pakete (apt) ───
+# sudo apt-get update
+# sudo apt-get install -y python3-pyqt5
+# sudo apt-get install -y python3-numpy
+# sudo apt-get install -y python3-opencv
+
+# ─── GStreamer für CSI-Kamera ───
+# Auf Jetson Nano ist GStreamer und nvarguscamerasrc meist vorinstalliert.
+# Falls nicht:
+# sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-bad
+# sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+# ─── DNN Face Detector Modell ───
+# Das Modell wird beim ersten Start automatisch heruntergeladen.
+# Alternativ manuell in den Ordner "models/" legen:
+#   - models/face_detector.caffemodel
+#   - models/deploy.prototxt
+# 
+# Download-Links:
+# caffemodel: https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel
+# prototxt:   https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt
+
+# ─── Starten ───
+# python3 main.py
+
+# ─── Optionale Emoji-PNGs ───
+# Lege BGRA-PNG-Dateien in den assets/ Ordner:
+#   assets/emoji_sunglasses.png
+#   assets/emoji_laugh.png
+#   assets/emoji_ghost.png
+#   assets/emoji_robot.png
+#   assets/emoji_cat.png
+#   assets/emoji_fire.png
+#   assets/emoji_heart.png
+#   assets/emoji_star.png
+# 
+# Ohne PNG-Dateien werden automatisch farbige Platzhalter-Kreise verwendet.
+# Du kannst beliebige BGRA-PNGs (mit Transparenz) verwenden.
+# Empfohlene Größe: 64×64 oder größer (wird automatisch skaliert).
+
+# ─── Tastenkürzel ───
+# ESC    → Beenden
+# S      → Screenshot
+# R      → Aufnahme starten/stoppen
+# SPACE  → Detection ein/ausschalten
