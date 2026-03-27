@@ -2,16 +2,19 @@
 """
 camera.py - Kamera-Handling Modul
 ===================================
-Separater Thread für Kamera-Capture.
+Nutzt jetson.utils.videoSource("csi://0") für die CSI-Kamera —
+genau wie der funktionierende Jetson-Beispielcode.
 
-Grünes Bild Fix:
-- appsink bekommt max-buffers=1 drop=true sync=false
-  → verhindert Buffer-Stau der zu grünen/leeren Frames führt
-- USB-Kamera Fallback mit minimiertem Buffer (CAP_PROP_BUFFERSIZE=1)
-- Falls CSI-Kamera grün bleibt: flip_method probieren (0, 2, 4, 6)
+Warum jetson.utils statt OpenCV/GStreamer direkt?
+- jetson.utils ist die native Jetson-Bibliothek von NVIDIA
+- Öffnet CSI-Kamera zuverlässig über csi://0
+- Kein manuelles GStreamer-Pipeline-Basteln nötig
+- Fällt automatisch auf USB (/dev/video0) zurück wenn CSI fehlt
+
+Frames werden von CUDA-Format (jetson.utils) in numpy/BGR konvertiert
+damit der Rest der App (OpenCV, BlurProcessor) normal weiterarbeitet.
 """
 
-import cv2
 import threading
 import queue
 import time
@@ -19,59 +22,11 @@ import numpy as np
 from typing import Optional
 
 
-def build_gstreamer_pipeline(
-    sensor_id: int = 0,
-    capture_width: int = 1280,
-    capture_height: int = 720,
-    display_width: int = 640,
-    display_height: int = 480,
-    framerate: int = 30,
-    flip_method: int = 0,
-) -> str:
-    """
-    GStreamer-Pipeline für Jetson Nano CSI-Kamera.
-
-    Grünes Bild tritt auf wenn:
-    - Der appsink Buffer sich staut (sync=false + drop=true behebt das)
-    - flip_method falsch gesetzt ist (0=keine Drehung, 2=180°, 4=90°, 6=270°)
-    - nvarguscamerasrc noch nicht bereit ist (kurz warten nach Start)
-    """
-    return (
-        f"nvarguscamerasrc sensor-id={sensor_id} ! "
-        f"video/x-raw(memory:NVMM), width=(int){capture_width}, "
-        f"height=(int){capture_height}, framerate=(fraction){framerate}/1 ! "
-        f"nvvidconv flip-method={flip_method} ! "
-        f"video/x-raw, width=(int){display_width}, height=(int){display_height}, "
-        f"format=(string)BGRx ! "
-        f"videoconvert ! "
-        f"video/x-raw, format=(string)BGR ! "
-        f"appsink max-buffers=1 drop=true sync=false"
-    )
-
-
-def _check_green_frame(frame: np.ndarray) -> bool:
-    """
-    Erkennt ob ein Frame rein grün ist (defekter CSI-Frame).
-    Gibt True zurück wenn der Frame als grün gilt und verworfen werden soll.
-    """
-    if frame is None:
-        return True
-    # Prüfe ob der Frame fast vollständig grün ist
-    # (B und R Kanal nahe 0, G Kanal dominant)
-    b_mean = float(frame[:, :, 0].mean())
-    g_mean = float(frame[:, :, 1].mean())
-    r_mean = float(frame[:, :, 2].mean())
-    # Grüner Frame: G >> B und G >> R
-    if g_mean > 100 and b_mean < 30 and r_mean < 30:
-        return True
-    return False
-
-
 class CameraThread(threading.Thread):
     """
     Kamera-Capture in einem eigenen Thread.
     Hält immer den aktuellsten Frame bereit (Queue maxsize=1).
-    Verwirft grüne/defekte Frames automatisch.
+    Nutzt jetson.utils.videoSource für zuverlässigen CSI-Zugriff.
     """
 
     def __init__(self, use_csi: bool = True, sensor_id: int = 0):
@@ -81,7 +36,6 @@ class CameraThread(threading.Thread):
 
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stop_event  = threading.Event()
-        self._cap: Optional[cv2.VideoCapture] = None
         self._is_running  = False
         self._error: Optional[str] = None
 
@@ -91,101 +45,196 @@ class CameraThread(threading.Thread):
         self._fps_timer   = time.time()
 
     def run(self):
-        self._cap = self._open_camera()
+        """Haupt-Capture-Loop."""
+        camera = self._open_camera()
 
-        if self._cap is None or not self._cap.isOpened():
+        if camera is None:
             self._error = "Keine Kamera gefunden"
             return
 
         self._is_running = True
 
-        # Kurz warten damit CSI-Kamera sich initialisiert
-        # (verhindert grüne Frames direkt nach dem Öffnen)
-        time.sleep(0.5)
-
-        green_frame_count = 0  # Zähler für aufeinanderfolgende grüne Frames
-
         while not self._stop_event.is_set():
-            ret, frame = self._cap.read()
+            try:
+                # Frame aufnehmen (jetson.utils Format)
+                img = camera.Capture()
 
-            if not ret or frame is None:
-                time.sleep(0.01)
+                if img is None:
+                    time.sleep(0.01)
+                    continue
+
+                # Von jetson CUDA-Image zu numpy BGR konvertieren
+                # jetson.utils liefert RGBA → wir brauchen BGR für OpenCV
+                import jetson.utils as ju
+                frame = ju.cudaToNumpy(img)          # RGBA numpy array
+                frame = frame[:, :, :3].copy()       # Alpha-Kanal entfernen → RGB
+                frame = frame[:, :, ::-1].copy()     # RGB → BGR für OpenCV
+
+                # FPS berechnen
+                self._frame_count += 1
+                now = time.time()
+                elapsed = now - self._fps_timer
+                if elapsed >= 1.0:
+                    self._fps = self._frame_count / elapsed
+                    self._frame_count = 0
+                    self._fps_timer = now
+
+                # Alten Frame verwerfen, neuen einreihen
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._frame_queue.put_nowait(frame)
+                except queue.Full:
+                    pass
+
+            except Exception as e:
+                print(f"Kamera Fehler: {e}")
+                time.sleep(0.05)
                 continue
 
-            # Grüne/defekte Frames verwerfen
-            if _check_green_frame(frame):
-                green_frame_count += 1
-                if green_frame_count > 30:
-                    # Nach 30 grünen Frames: Kamera neu initialisieren
-                    print("Grüne Frames erkannt – versuche Kamera neu zu öffnen...")
-                    self._cap.release()
-                    time.sleep(1.0)
-                    self._cap = self._open_camera()
-                    green_frame_count = 0
-                    if self._cap is None or not self._cap.isOpened():
-                        self._error = "Kamera nach Neustart nicht verfügbar"
-                        break
-                time.sleep(0.01)
-                continue
-
-            green_frame_count = 0  # Zurücksetzen bei gültigem Frame
-
-            # FPS berechnen
-            self._frame_count += 1
-            now = time.time()
-            elapsed = now - self._fps_timer
-            if elapsed >= 1.0:
-                self._fps = self._frame_count / elapsed
-                self._frame_count = 0
-                self._fps_timer = now
-
-            # Alten Frame verwerfen, neuen einreihen
-            try:
-                self._frame_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._frame_queue.put_nowait(frame)
-            except queue.Full:
-                pass
-
-        if self._cap:
-            self._cap.release()
         self._is_running = False
 
-    def _open_camera(self) -> Optional[cv2.VideoCapture]:
-        """Versucht CSI-Kamera, fällt auf USB-Kamera zurück."""
-        if self.use_csi:
-            print("Versuche CSI-Kamera (GStreamer)...")
-            pipeline = build_gstreamer_pipeline(
-                sensor_id=self.sensor_id,
-                capture_width=1280,
-                capture_height=720,
-                display_width=640,
-                display_height=480,
-                framerate=30,
-                flip_method=0,
-            )
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-            if cap.isOpened():
-                print("CSI-Kamera geöffnet")
-                return cap
-            print("CSI-Kamera nicht verfügbar, versuche USB-Kamera...")
+    def _open_camera(self):
+        """
+        Öffnet Kamera mit jetson.utils.videoSource.
+        CSI: csi://0  (wie im funktionierenden Beispielcode)
+        USB: /dev/video0
+        """
+        try:
+            import jetson.utils as ju
 
-        # Fallback: USB-Kamera
-        print("Versuche USB-Kamera (Index 0)...")
+            if self.use_csi:
+                print("Öffne CSI-Kamera (csi://0) ...")
+                try:
+                    # Genau wie im funktionierenden Jetson-Beispielcode
+                    camera = ju.videoSource("csi://0")
+                    # Kurz testen ob ein Frame kommt
+                    test_img = camera.Capture()
+                    if test_img is not None:
+                        print("CSI-Kamera geöffnet")
+                        return camera
+                    else:
+                        print("CSI-Kamera liefert keinen Frame, versuche USB...")
+                except Exception as e:
+                    print(f"CSI-Kamera Fehler: {e}, versuche USB...")
+
+            # Fallback: USB-Kamera
+            print("Öffne USB-Kamera (/dev/video0) ...")
+            camera = ju.videoSource("/dev/video0")
+            test_img = camera.Capture()
+            if test_img is not None:
+                print("USB-Kamera geöffnet")
+                return camera
+
+            print("Keine Kamera gefunden")
+            return None
+
+        except ImportError:
+            # jetson.utils nicht verfügbar → OpenCV Fallback
+            print("jetson.utils nicht verfügbar, versuche OpenCV...")
+            return self._open_camera_opencv()
+
+    def _open_camera_opencv(self):
+        """
+        OpenCV Fallback wenn jetson.utils nicht installiert ist.
+        Gibt ein OpenCV VideoCapture-kompatibles Objekt zurück.
+        """
+        import cv2
+
+        # Wrapper damit OpenCV VideoCapture wie jetson.utils aussieht
+        class OpenCVCameraWrapper:
+            def __init__(self, cap):
+                self._cap = cap
+
+            def Capture(self):
+                ret, frame = self._cap.read()
+                if not ret:
+                    return None
+                # Gib ein Objekt zurück das wie jetson CUDA-Image aussieht
+                # aber eigentlich schon ein numpy BGR Array ist
+                return _OpenCVFrameWrapper(frame)
+
+            def release(self):
+                self._cap.release()
+
+        class _OpenCVFrameWrapper:
+            """Wrapper damit OpenCV-Frame wie jetson CUDA-Image behandelt wird."""
+            def __init__(self, frame):
+                self._frame = frame
+
+        # Patch: run() muss wissen ob es jetson oder OpenCV ist
+        # Einfachste Lösung: direkt separaten OpenCV-Loop nutzen
+        self._use_opencv_fallback = True
+
         cap = cv2.VideoCapture(0)
         if cap.isOpened():
-            # Buffer minimieren = keine grünen/alten Frames
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_FPS, 30)
-            print("USB-Kamera geöffnet")
-            return cap
+            print("OpenCV USB-Kamera geöffnet")
+            return OpenCVCameraWrapper(cap)
 
-        print("Keine Kamera gefunden")
         return None
+
+    def run(self):
+        """Haupt-Capture-Loop — unterstützt jetson.utils und OpenCV."""
+        self._use_opencv_fallback = False
+        camera = self._open_camera()
+
+        if camera is None:
+            self._error = "Keine Kamera gefunden"
+            return
+
+        self._is_running = True
+
+        # Unterscheide zwischen jetson.utils und OpenCV Fallback
+        use_jetson = not getattr(self, '_use_opencv_fallback', False)
+
+        while not self._stop_event.is_set():
+            try:
+                img = camera.Capture()
+
+                if img is None:
+                    time.sleep(0.01)
+                    continue
+
+                if use_jetson:
+                    # jetson.utils: CUDA Image → numpy BGR
+                    import jetson.utils as ju
+                    frame = ju.cudaToNumpy(img)      # RGBA
+                    frame = frame[:, :, :3].copy()   # → RGB
+                    frame = frame[:, :, ::-1].copy() # → BGR
+                else:
+                    # OpenCV Wrapper: Frame ist bereits BGR numpy
+                    frame = img._frame
+
+                # FPS berechnen
+                self._frame_count += 1
+                now = time.time()
+                elapsed = now - self._fps_timer
+                if elapsed >= 1.0:
+                    self._fps = self._frame_count / elapsed
+                    self._frame_count = 0
+                    self._fps_timer = now
+
+                # Frame einreihen
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._frame_queue.put_nowait(frame)
+                except queue.Full:
+                    pass
+
+            except Exception as e:
+                print(f"Kamera Fehler: {e}")
+                time.sleep(0.05)
+
+        self._is_running = False
 
     def get_frame(self) -> Optional[np.ndarray]:
         try:
