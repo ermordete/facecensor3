@@ -2,13 +2,14 @@
 """
 ui.py – Hauptfenster
 ======================
-Korrekturen v5:
-- Screenshot-Bug behoben: verwendet letzten verarbeiteten Frame aus dem
-  ProcessingThread statt einen neuen Raw-Frame + parallele Detektion.
-  (Vorher: Race Condition + concurrent detector access → falsches Ergebnis)
-- Hautfarb-Handerkennung vollständig entfernt
-- Hand-Toggle wird sauber deaktiviert wenn MediaPipe-Modell nicht verfügbar
-- Hand-Toggle zeigt klaren Hinweis wenn Modell fehlt
+Kernfunktionen:
+- Gesichtszensur / Blur
+- Blur-Stärke Slider
+- Modellauswahl (Haar Cascade / OpenCV DNN)
+- Aufnahme starten / stoppen
+- Screenshot
+
+Handzensur vollständig entfernt.
 """
 
 import cv2
@@ -27,7 +28,6 @@ from PyQt5.QtGui import QImage, QPixmap
 
 from camera import CameraThread
 from detector import FaceDetector, MODEL_HAAR, MODEL_DNN, MODEL_NAMES
-from hand_detector import HandDetector
 from effects import BlurProcessor
 from recorder import Recorder
 
@@ -55,9 +55,8 @@ FONT = '"Noto Sans", "DejaVu Sans", "Liberation Sans", Arial, sans-serif'
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PERFORMANCE
 # ═══════════════════════════════════════════════════════════════════════════════
-FACE_DETECT_EVERY = 3   # Gesichtserkennung alle 3 Frames (~10x/Sek bei 30fps)
-HAND_DETECT_EVERY = 4   # Handerkennung alle 4 Frames  (~7x/Sek bei 30fps)
-FPS_WINDOW        = 30  # Gleitender Durchschnitt über 30 Frames
+FACE_DETECT_EVERY = 3   # Gesichtserkennung alle 3 Frames
+FPS_WINDOW        = 30  # Gleitender FPS-Durchschnitt
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STYLESHEET
@@ -163,46 +162,34 @@ class ProcessingThread(QThread):
     """
     Frame-Verarbeitung: Detection + Blur, entkoppelt vom UI-Thread.
 
-    FIX Screenshot-Bug:
-    - Letzter fertig verarbeiteter Frame wird in _last_processed_frame
-      gecacht (thread-safe via Lock).
-    - Screenshot liest diesen Cache statt einen neuen Raw-Frame zu holen
-      und parallel detect() aufzurufen (das war die Race Condition).
-
-    Performance:
-    - Gesicht alle FACE_DETECT_EVERY Frames
-    - Hände alle HAND_DETECT_EVERY Frames (versetzt um 1 Frame Offset)
-    - Zwischen Detection-Frames: letzte Bounding Boxes weiterverwenden
+    - Gesichtserkennung alle FACE_DETECT_EVERY Frames
+    - Letzter verarbeiteter Frame wird gecacht für Screenshot (thread-safe)
+    - Gleitender FPS-Durchschnitt über FPS_WINDOW Frames
     """
-    frame_ready = pyqtSignal(np.ndarray, int, int, float)
+    frame_ready = pyqtSignal(np.ndarray, int, float)  # frame, gesichter, fps
 
     def __init__(
         self,
         camera:        CameraThread,
         face_detector: FaceDetector,
-        hand_detector: HandDetector,
         blur:          BlurProcessor,
         recorder:      Recorder,
     ):
         super().__init__()
         self.camera        = camera
         self.face_detector = face_detector
-        self.hand_detector = hand_detector
         self.blur          = blur
         self.recorder      = recorder
 
-        self._running      = True
-        self._face_on      = True
-        self._hand_on      = False
-
-        self._fc           = 0
+        self._running    = True
+        self._face_on    = True
+        self._fc         = 0
         self._last_faces: list = []
-        self._last_hands: list = []
-        self._ts: deque        = deque(maxlen=FPS_WINDOW)
+        self._ts: deque  = deque(maxlen=FPS_WINDOW)
 
-        # Cache für Screenshot (thread-safe)
-        self._frame_lock              = threading.Lock()
-        self._last_processed_frame: np.ndarray = None
+        # Letzter fertiger Frame für Screenshot (thread-safe)
+        self._frame_lock             = threading.Lock()
+        self._last_processed_frame   = None
 
     def run(self):
         while self._running:
@@ -213,7 +200,7 @@ class ProcessingThread(QThread):
 
             self._fc += 1
 
-            # ── Gesichtserkennung ──
+            # Gesichtserkennung (alle N Frames)
             if self._face_on:
                 if self._fc % FACE_DETECT_EVERY == 0:
                     self._last_faces = self.face_detector.detect(frame)
@@ -223,25 +210,15 @@ class ProcessingThread(QThread):
                 self._last_faces = []
                 face_count = 0
 
-            # ── Handerkennung (versetzt um 1 Frame) ──
-            if self._hand_on and self.hand_detector.is_available():
-                if (self._fc + 1) % HAND_DETECT_EVERY == 0:
-                    self._last_hands = self.hand_detector.detect(frame)
-                frame = self.blur.apply(frame, self._last_hands)
-                hand_count = len(self._last_hands)
-            else:
-                self._last_hands = []
-                hand_count = 0
-
-            # ── Aufnahme ──
+            # Aufnahme
             if self.recorder.is_recording:
                 self.recorder.write_frame(frame)
 
-            # ── Letzten verarbeiteten Frame cachen (für Screenshot) ──
+            # Letzten Frame cachen für Screenshot
             with self._frame_lock:
                 self._last_processed_frame = frame.copy()
 
-            # ── FPS (gleitender Durchschnitt) ──
+            # FPS berechnen
             now = time.monotonic()
             self._ts.append(now)
             fps = (
@@ -249,13 +226,9 @@ class ProcessingThread(QThread):
                 if len(self._ts) >= 2 else 0.0
             )
 
-            self.frame_ready.emit(frame, face_count, hand_count, fps)
+            self.frame_ready.emit(frame, face_count, fps)
 
-    def get_last_processed_frame(self) -> np.ndarray:
-        """
-        Gibt den letzten fertig verarbeiteten Frame zurück (thread-safe).
-        Wird für Screenshot verwendet — kein paralleler detect()-Aufruf nötig.
-        """
+    def get_last_processed_frame(self):
         with self._frame_lock:
             if self._last_processed_frame is not None:
                 return self._last_processed_frame.copy()
@@ -265,11 +238,6 @@ class ProcessingThread(QThread):
         self._face_on = enabled
         if not enabled:
             self._last_faces = []
-
-    def set_hand(self, enabled: bool):
-        self._hand_on = enabled
-        if not enabled:
-            self._last_hands = []
 
     def stop(self):
         self._running = False
@@ -285,21 +253,19 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FaceCensor Pro")
-        self.setMinimumSize(960, 620)
-        self.resize(1100, 700)
+        self.setMinimumSize(900, 600)
+        self.resize(1080, 680)
         self.setStyleSheet(STYLE)
 
         self.camera        = CameraThread(use_csi=True)
         self.face_detector = FaceDetector(model=MODEL_DNN)
-        self.hand_detector = HandDetector()
         self.blur          = BlurProcessor()
         self.recorder      = Recorder()
 
         self._build_ui()
 
         self.proc = ProcessingThread(
-            self.camera, self.face_detector, self.hand_detector,
-            self.blur, self.recorder,
+            self.camera, self.face_detector, self.blur, self.recorder,
         )
         self.proc.frame_ready.connect(self._on_frame)
         self.camera.start()
@@ -353,7 +319,8 @@ class MainWindow(QMainWindow):
         )
         sub = QLabel("  ·  Jetson Nano Edition")
         sub.setStyleSheet(
-            f"color: {C_TEXT_DIM}; font-size: 12px; font-family: {FONT}; background: transparent;"
+            f"color: {C_TEXT_DIM}; font-size: 12px; "
+            f"font-family: {FONT}; background: transparent;"
         )
         hbox.addWidget(title)
         hbox.addWidget(sub)
@@ -377,45 +344,19 @@ class MainWindow(QMainWindow):
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(10)
 
-        # ── Zensur-Toggles ──
+        # ── Gesichtszensur ──
         censor_card = _card()
         cv = QVBoxLayout(censor_card)
         cv.setContentsMargins(14, 14, 14, 14)
         cv.setSpacing(7)
         cv.addWidget(_lbl("Zensur"))
 
-        # Gesichtszensur
         self.face_btn = QPushButton("Gesichter  ·  aktiv")
         self.face_btn.setCheckable(True)
         self.face_btn.setChecked(True)
         self.face_btn.setStyleSheet(_ss(C_ACCENT, "#FFF", "#5BAECE"))
         self.face_btn.toggled.connect(self._on_face_toggled)
         cv.addWidget(self.face_btn)
-
-        # Handzensur – nur aktivierbar wenn MediaPipe-Modell vorhanden
-        hand_available = self.hand_detector.is_available()
-        self.hand_btn = QPushButton(
-            "Hände  ·  inaktiv" if hand_available
-            else "Hände  ·  Modell fehlt"
-        )
-        self.hand_btn.setCheckable(True)
-        self.hand_btn.setChecked(False)
-        self.hand_btn.setEnabled(hand_available)
-        self.hand_btn.setStyleSheet(
-            _ss_beige() if hand_available
-            else (
-                f"QPushButton {{ background-color: {C_PANEL}; color: {C_TEXT_DIM}; "
-                f"border: 1px solid {C_BORDER}; border-radius: 8px; padding: 9px 14px; "
-                f"font-family: {FONT}; font-size: 12px; text-align: left; }}"
-            )
-        )
-        if not hand_available:
-            self.hand_btn.setToolTip(
-                "models/hand_landmarker.task nicht gefunden.\n"
-                "Beim ersten Start mit Internet wird es automatisch heruntergeladen."
-            )
-        self.hand_btn.toggled.connect(self._on_hand_toggled)
-        cv.addWidget(self.hand_btn)
 
         vbox.addWidget(censor_card)
 
@@ -428,6 +369,7 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.setSpacing(8)
+
         self.strength_slider = QSlider(Qt.Horizontal)
         self.strength_slider.setRange(1, 100)
         self.strength_slider.setValue(50)
@@ -546,13 +488,10 @@ class MainWindow(QMainWindow):
 
         fps_w,  self.fps_lbl  = stat("BILDRATE",  "—")
         face_w, self.face_lbl = stat("GESICHTER", "0")
-        hand_w, self.hand_lbl = stat("HÄNDE",     "0")
 
         hbox.addWidget(fps_w)
         hbox.addWidget(_vline())
         hbox.addWidget(face_w)
-        hbox.addWidget(_vline())
-        hbox.addWidget(hand_w)
         return bar
 
     # ── Rechtes Panel ─────────────────────────────────────────────────────────
@@ -597,11 +536,13 @@ class MainWindow(QMainWindow):
 
         self.status_lbl = QLabel("Bereit  ·  Kamera wird initialisiert …")
         self.status_lbl.setStyleSheet(
-            f"color: {C_TEXT_DIM}; font-size: 11px; font-family: {FONT}; background: transparent;"
+            f"color: {C_TEXT_DIM}; font-size: 11px; "
+            f"font-family: {FONT}; background: transparent;"
         )
-        hint = QLabel("ESC = Beenden   S = Screenshot   R = Aufnahme   Leertaste = Gesichter")
+        hint = QLabel("ESC = Beenden   S = Screenshot   R = Aufnahme   Leertaste = Zensur")
         hint.setStyleSheet(
-            f"color: {C_TEXT_DIM}; font-size: 10px; font-family: {FONT}; background: transparent;"
+            f"color: {C_TEXT_DIM}; font-size: 10px; "
+            f"font-family: {FONT}; background: transparent;"
         )
         hbox.addWidget(self.status_lbl)
         hbox.addStretch()
@@ -620,9 +561,7 @@ class MainWindow(QMainWindow):
 
     # ── Event Handler ─────────────────────────────────────────────────────────
 
-    def _on_frame(
-        self, frame: np.ndarray, face_count: int, hand_count: int, fps: float
-    ):
+    def _on_frame(self, frame: np.ndarray, face_count: int, fps: float):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         pixmap = QPixmap.fromImage(
@@ -633,7 +572,6 @@ class MainWindow(QMainWindow):
         self.video_label.setPixmap(pixmap)
         self.fps_lbl.setText(f"{fps:.1f}" if fps > 0.5 else "—")
         self.face_lbl.setText(str(face_count))
-        self.hand_lbl.setText(str(hand_count))
 
     def _on_face_toggled(self, enabled: bool):
         self.proc.set_face(enabled)
@@ -645,18 +583,6 @@ class MainWindow(QMainWindow):
         )
         self.status_lbl.setText(
             "Gesichtszensur " + ("aktiviert" if enabled else "deaktiviert")
-        )
-
-    def _on_hand_toggled(self, enabled: bool):
-        self.proc.set_hand(enabled)
-        self.hand_btn.setText(
-            "Hände  ·  aktiv" if enabled else "Hände  ·  inaktiv"
-        )
-        self.hand_btn.setStyleSheet(
-            _ss(C_ACCENT, "#FFF", "#5BAECE") if enabled else _ss_beige()
-        )
-        self.status_lbl.setText(
-            "Handzensur " + ("aktiviert" if enabled else "deaktiviert")
         )
 
     def _on_model_select(self, model: str):
@@ -671,14 +597,6 @@ class MainWindow(QMainWindow):
         self.blur.set_strength(value)
 
     def _take_screenshot(self):
-        """
-        Screenshot-Fix:
-        Verwendet den letzten fertig verarbeiteten Frame aus dem ProcessingThread.
-        Damit wird exakt das gespeichert, was der Nutzer in der Vorschau sieht:
-        - Originalbild
-        - Nur erkannte Gesichter/Hände geblurrt
-        - Kein paralleler detect()-Aufruf, keine Race Condition
-        """
         frame = self.proc.get_last_processed_frame()
         if frame is not None:
             filename = self.recorder.save_screenshot(frame)
@@ -740,7 +658,6 @@ class MainWindow(QMainWindow):
         if self.recorder.is_recording:
             self.recorder.stop_recording()
         self.proc.stop()
-        self.hand_detector.close()
         self.camera.stop()
         self.camera.join(timeout=2.0)
         event.accept()
